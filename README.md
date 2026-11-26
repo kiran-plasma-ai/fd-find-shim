@@ -1,4 +1,4 @@
-# find-shim
+# fd-find-shim
 
 ![shell](https://img.shields.io/badge/bash-%E2%89%A54.4-4EAA25?logo=gnubash&logoColor=white)
 ![deps](https://img.shields.io/badge/deps-fd%20only-blue)
