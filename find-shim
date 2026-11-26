@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# find — fd-accelerated find shim (see SPEC.md). Requires bash >= 4.4.
+#
+# Translates a find(1) invocation to fd(1) when the ENTIRE expression maps
+# onto verified fd flags; otherwise execs the real find with the original
+# argv untouched. Never a partial translation.
+set -u
+
+FIND_WRAP_MODE=${FIND_WRAP_MODE:-compatible}
+FIND_WRAP_DEBUG=${FIND_WRAP_DEBUG:-0}
+FIND_WRAP_OFF=${FIND_WRAP_OFF:-0}
+
+debug() {
+	[[ $FIND_WRAP_DEBUG == 1 ]] && printf 'find-shim: %s\n' "$*" >&2
+	return 0
+}
+
+# Inode comparison catches symlinks AND hardlinks to the shim; a path-string
+# compare (realpath) misses hardlinks.
+is_self() { [[ -e $0 && $1 -ef $0 ]]; }
+
+real_find() {
+	local p d
+	if [[ -n ${FIND_WRAP_REAL_FIND:-} && -x ${FIND_WRAP_REAL_FIND} ]] && ! is_self "$FIND_WRAP_REAL_FIND"; then
+		printf '%s\n' "$FIND_WRAP_REAL_FIND"
+		return 0
+	fi
+	for p in /usr/bin/find /bin/find; do
+		if [[ -x $p ]] && ! is_self "$p"; then
+			printf '%s\n' "$p"
+			return 0
+		fi
+	done
+	local IFS=:
+	for d in $PATH; do
+		p=${d:-.}/find # empty PATH element means cwd
+		if [[ -f $p && -x $p ]] && ! is_self "$p"; then
+			printf '%s\n' "$p"
+			return 0
+		fi
+	done
+	return 1
+}
+
+fallback() {
+	local rf
+	if ! rf=$(real_find); then
+		printf 'find-shim: real find not found\n' >&2
+		exit 127
+	fi
+	debug "fallback -> $rf $*"
+	exec "$rf" "$@"
+}
+
+locate_fd() {
+	local p
+	if [[ -n ${FIND_WRAP_FD:-} ]]; then
+		[[ -x $FIND_WRAP_FD ]] && { printf '%s\n' "$FIND_WRAP_FD"; return 0; }
+		return 1
+	fi
+	for p in /usr/bin/fd /usr/bin/fdfind; do
+		[[ -x $p ]] && { printf '%s\n' "$p"; return 0; }
+	done
+	if p=$(type -P fd 2>/dev/null) && [[ -x $p ]]; then printf '%s\n' "$p"; return 0; fi
+	if p=$(type -P fdfind 2>/dev/null) && [[ -x $p ]]; then printf '%s\n' "$p"; return 0; fi
+	return 1
+}
+
+fd_usable() {
+	local v
+	v=$("$1" --version 2>/dev/null) || return 1
+	[[ $v =~ ^fd[[:space:]]+([0-9]+)\. ]] || return 1
+	(( BASH_REMATCH[1] >= 9 ))
+}
+
+main() {
+	[[ $FIND_WRAP_OFF == 1 ]] && fallback "$@"
+
+	local FD
+	FD=$(locate_fd) || fallback "$@"
+	fd_usable "$FD" || fallback "$@"
+
+	local -a args=("$@") paths=() fdargs=()
+	local n=$# i=0 t a unit
+	local follow_mode=P # -H/-L/-P are mutually exclusive; last one wins
+	local nameglob='' namecase=''
+	local seen_type=0 seen_time=0 seen_user=0 seen_group=0 seen_maxd=0 seen_mind=0 seen_print=0
+
+	# Global options: find [-H|-L|-P] path... [expression]
+	while (( i < n )); do
+		case ${args[i]} in
+		-L) follow_mode=L; ((i++)) ;;
+		-H) follow_mode=H; ((i++)) ;;
+		-P) follow_mode=P; ((i++)) ;;
+		*) break ;;
+		esac
+	done
+
+	# Path operands: everything up to the first expression token.
+	while (( i < n )); do
+		t=${args[i]}
+		case $t in
+		-* | '!' | '(' | ')') break ;;
+		*) paths+=("$t"); ((i++)) ;;
+		esac
+	done
+	# No path operands: real find defaults to searching '.' — let it, with
+	# the exact original argv (its diagnostics and defaults are its own).
+	(( ${#paths[@]} > 0 )) || fallback "$@"
+
+	# Symlink search roots: fd follows dir-symlink roots by default (find
+	# -P does not) and errors on file-symlink roots. find -H/-L follow
+	# command-line symlinks, which fd's default matches for directories.
+	local p
+	for p in "${paths[@]}"; do
+		if [[ -L $p ]]; then
+			[[ $follow_mode != P && -d $p ]] || fallback "$@"
+		fi
+	done
+
+	# Parity flags: find shows hidden and ignored files, never colors.
+	if [[ $FIND_WRAP_MODE != fast ]]; then
+		fdargs+=(--hidden --no-ignore --color=never)
+	fi
+	[[ $follow_mode == L ]] && fdargs+=(-L)
+
+	while (( i < n )); do
+		t=${args[i]}
+		((i++))
+		case $t in
+		-name | -iname)
+			(( i < n )) || fallback "$@"
+			[[ -z $nameglob ]] || fallback "$@"          # multiple name predicates
+			nameglob=${args[i]}
+			# '': find matches nothing. a/b: find matches basenames only.
+			# -*: fd's option parser would eat it. All: real find decides.
+			[[ -n $nameglob && $nameglob != */* && $nameglob != -* ]] || fallback "$@"
+			namecase=$t
+			((i++))
+			;;
+		-type)
+			(( i < n )) || fallback "$@"
+			(( seen_type == 0 )) || fallback "$@"        # find ANDs types, fd ORs them
+			seen_type=1
+			case ${args[i]} in
+			f | d | l) fdargs+=(-t "${args[i]}") ;;
+			*) fallback "$@" ;;
+			esac
+			((i++))
+			;;
+		-empty) fdargs+=(-t e) ;;
+		# -executable: find matches executable files AND searchable dirs;
+		# fd -t x implies files only and cannot express the dir half.
+		-maxdepth)
+			(( i < n )) || fallback "$@"
+			(( seen_maxd == 0 )) || fallback "$@"
+			seen_maxd=1
+			[[ ${args[i]} =~ ^[0-9]{1,9}$ ]] || fallback "$@"
+			fdargs+=(-d "${args[i]}")
+			((i++))
+			;;
+		-mindepth)
+			(( i < n )) || fallback "$@"
+			(( seen_mind == 0 )) || fallback "$@"
+			seen_mind=1
+			[[ ${args[i]} =~ ^[0-9]{1,9}$ ]] || fallback "$@"
+			fdargs+=(--min-depth "${args[i]}")
+			((i++))
+			;;
+		-mtime | -mmin)
+			(( i < n )) || fallback "$@"
+			# find ANDs repeated time predicates; fd is last-wins for the
+			# same flag, so at most one time predicate total.
+			(( seen_time == 0 )) || fallback "$@"
+			seen_time=1
+			if [[ $t == -mtime ]]; then unit=d; else unit=m; fi
+			a=${args[i]}
+			case $a in
+			-[0-9]*)
+				# N=0 inverts meaning under fd's windows: real find decides.
+				[[ $a =~ ^-[1-9][0-9]{0,8}$ ]] || fallback "$@"
+				fdargs+=(--changed-within "${a#-}$unit")
+				;;
+			+[0-9]*)
+				[[ $a =~ ^\+[1-9][0-9]{0,8}$ ]] || fallback "$@"
+				fdargs+=(--changed-before "${a#+}$unit")
+				;;
+			*) fallback "$@" ;;                          # exact -mtime N: fd windows are one-sided
+			esac
+			((i++))
+			;;
+		-user)
+			(( i < n )) || fallback "$@"
+			(( seen_user == 0 )) || fallback "$@"
+			seen_user=1
+			# find rejects empty/colon/option-like names with its own
+			# diagnostic; fd -o '' would silently list everything.
+			[[ ${args[i]} =~ ^[^:-][^:]*$ ]] || fallback "$@"
+			fdargs+=(-o "${args[i]}")
+			((i++))
+			;;
+		-group)
+			(( i < n )) || fallback "$@"
+			(( seen_group == 0 )) || fallback "$@"
+			seen_group=1
+			[[ ${args[i]} =~ ^[^:-][^:]*$ ]] || fallback "$@"
+			fdargs+=(-o ":${args[i]}")
+			((i++))
+			;;
+		-print0)
+			# find duplicates output on repeated actions; fd dedups.
+			(( seen_print == 0 )) || fallback "$@"
+			seen_print=1
+			fdargs+=(-0)
+			;;
+		-print)
+			(( seen_print == 0 )) || fallback "$@"
+			seen_print=1
+			;;
+		*) fallback "$@" ;;                              # -size -path -regex -delete -exec -prune ...
+		esac
+	done
+
+	# fd's positional pattern is a REGEX; globs go through -g. The positional
+	# slot is used only for the empty match-all pattern.
+	local pattern=''
+	if [[ -n $nameglob ]]; then
+		fdargs+=(-g)
+		if [[ $namecase == -name ]]; then fdargs+=(-s); else fdargs+=(-i); fi
+		pattern=$nameglob
+	fi
+
+	debug "fd -> $FD ${fdargs[*]} $pattern ${paths[*]}"
+	exec "$FD" "${fdargs[@]}" "$pattern" "${paths[@]}"
+}
+
+main "$@"
