@@ -1,0 +1,4 @@
+# tests/run.sh creates a fixture FILE named "secret" to test hidden-file parity;
+# it contains no credential material.
+^tests/run\.sh:.*secret
+^\.leakscan-allow:
